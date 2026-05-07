@@ -1,0 +1,7 @@
+.claude
+/build
+/dist
+__pycache__
+launcher.build
+launcher.dist
+launcher.onefile-build
