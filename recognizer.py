@@ -56,6 +56,15 @@ class SpeechRecognizer:
     def stop(self):
         self._stop_event.set()
 
+    def unload(self):
+        """Forget the cached model so a deleted one is not reused from memory."""
+        with self._lock:
+            if self.running:
+                return False
+            self._model = None
+            self._loaded_key = None
+        return True
+
     def _audio_callback(self, indata, frames, time_info, status):
         if self._stop_event.is_set():
             return

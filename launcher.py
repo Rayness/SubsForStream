@@ -18,13 +18,22 @@ from PIL import Image
 import pystray
 from recognizer import SpeechRecognizer
 from discord_capture import DiscordCapture
+from models import MODEL_CACHE, delete_model, download_model, installed_models
 from server import SubtitleServer
-from settings import BASE_DIR, load_config, save_config
+from settings import BASE_DIR, CONFIG_FILE, load_config, save_config
+from single_instance import SingleInstance
+from version import VERSION, is_newer, latest_release
 
 
 
 def resource(name):
     return Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent)) / name
+
+
+def format_size(size):
+    if size >= 1024 ** 3:
+        return f'{size / 1024 ** 3:.1f} ГБ'
+    return f'{size / 1024 ** 2:.0f} МБ'
 
 
 def open_browser(url):
@@ -43,7 +52,7 @@ class LauncherWindow(DesktopUI):
         self.server = server
         ctk.set_appearance_mode('dark')
         self.root = ctk.CTk()
-        self.root.title('SubForStream — субтитры для OBS')
+        self.root.title(f'SubForStream {VERSION} — субтитры для OBS')
         self.root.geometry('1160x840')
         self.root.minsize(960, 680)
         self.root.configure(fg_color=BG)
@@ -61,6 +70,13 @@ class LauncherWindow(DesktopUI):
         server._on_caption = self._on_caption
         self.discord_status = 'Не подключён'
         self.discord = DiscordCapture(server, lambda message: setattr(self, 'discord_status', message))
+        self.config_path = CONFIG_FILE
+        self.models_path = MODEL_CACHE
+        self.update_status = ''
+        self.model_status = ''
+        self.models = {}
+        self.model_download = None
+        self.model_stop = threading.Event()
         self._participant_text = {}
         self._participant_rows = None
         self._ui_running = None
@@ -151,6 +167,104 @@ class LauncherWindow(DesktopUI):
             except ValueError as exc:
                 messagebox.showerror('Discord', str(exc), parent=self.root)
 
+    def _refresh_models(self):
+        def scan():
+            try:
+                items = installed_models()
+            except OSError as exc:
+                self.model_status = f'Не удалось прочитать папку моделей: {exc}'
+                return
+            self.actions.put(lambda: self._render_models(items))
+        threading.Thread(target=scan, daemon=True).start()
+
+    def _render_models(self, items):
+        self.models = {item['name']: item for item in items}
+        busy = self.model_download is not None
+        for item in items:
+            state, button = self.model_rows[item['name']]
+            if self.model_download == item['name']:
+                text, color, action, enabled = 'Скачивается…', ACCENT, 'Отменить', True
+            elif item['state'] == 'ready':
+                text, color = f"Готова · {format_size(item['size'])}", GREEN
+                action, enabled = ('Удалить', not busy) if item['removable'] else ('Папка Vosk', False)
+            elif item['state'] == 'broken':
+                text, color, action, enabled = 'Не докачана', '#f87171', 'Удалить', not busy
+            else:
+                text, color, action, enabled = 'Не скачана', DIM, 'Скачать', not busy
+            state.configure(text=text, text_color=color)
+            button.configure(text=action, state='normal' if enabled else 'disabled')
+        total = sum(item['size'] for item in items if item['path'])
+        self.models_total.set(f'Всего на диске: {format_size(total)}')
+
+    def _model_action(self, name):
+        item = self.models.get(name)
+        if item is None:
+            return
+        if self.model_download == name:
+            self.model_stop.set()
+            self.model_status = 'Отмена загрузки…'
+            return
+        if self.model_download:
+            return
+        if item['state'] == 'missing':
+            self.model_download = name
+            self.model_stop = threading.Event()
+            threading.Thread(target=self._download_model, args=(item,), daemon=True).start()
+        elif self._delete_model(item):
+            self.model_status = f"{item['title']}: удалена"
+        self._refresh_models()
+
+    def _download_model(self, item):
+        try:
+            download_model(item['name'], lambda message: setattr(self, 'model_status', message), self.model_stop)
+            self.model_status = f"{item['title']}: скачана ✓"
+        except InterruptedError:
+            self.model_status = 'Загрузка отменена'
+        except Exception as exc:
+            self.model_status = f'Ошибка загрузки: {exc}'
+        finally:
+            self.actions.put(self._finish_download)
+
+    def _finish_download(self):
+        self.model_download = None
+        self._refresh_models()
+
+    def _delete_model(self, item):
+        if self.recognizer.running or self.discord.running:
+            messagebox.showinfo('Модели', 'Остановите микрофон и Discord, затем удалите модель.', parent=self.root)
+            return False
+        if not messagebox.askyesno('Удалить модель', f"Удалить «{item['title']}»?\nОсвободится {format_size(item['size'])}. "
+                                   'Если снова выбрать эту модель, она скачается заново.', parent=self.root):
+            return False
+        try:
+            delete_model(item['path'])
+        except (OSError, ValueError) as exc:
+            messagebox.showerror('Модели', f'Не удалось удалить модель: {exc}', parent=self.root)
+            return False
+        self.recognizer.unload()
+        return True
+
+    def _open_models(self):
+        MODEL_CACHE.mkdir(parents=True, exist_ok=True)
+        os.startfile(MODEL_CACHE)
+
+    def _open_config_folder(self):
+        os.startfile(CONFIG_FILE.parent)
+
+    def _check_updates(self):
+        self.update_button.configure(state='disabled')
+        self.update_status = 'Проверка…'
+        def check():
+            try:
+                latest = latest_release()
+                self.update_status = (f'Доступна версия {latest}. Скачайте её на странице загрузки.' if is_newer(latest)
+                                      else f'У вас последняя версия ({VERSION}).')
+            except Exception:
+                self.update_status = 'Не удалось проверить обновления. Проверьте интернет или откройте страницу загрузки.'
+            finally:
+                self.actions.put(lambda: self.update_button.configure(state='normal'))
+        threading.Thread(target=check, daemon=True).start()
+
     def _demo(self):
         if not self._apply():
             return
@@ -188,6 +302,10 @@ class LauncherWindow(DesktopUI):
             self.status_var.set(self.status)
         if self.discord_status_var.get() != self.discord_status:
             self.discord_status_var.set(self.discord_status)
+        if self.model_status_var.get() != self.model_status:
+            self.model_status_var.set(self.model_status)
+        if self.update_status_var.get() != self.update_status:
+            self.update_status_var.set(self.update_status)
         rows = tuple((key, name, self._participant_text.get(key, ''), drops) for key, name, drops in self.discord.participants())
         if rows != self._participant_rows:
             for item in self.participant_table.get_children():
@@ -250,9 +368,14 @@ class LauncherWindow(DesktopUI):
     def show(self):
         self.root.deiconify()
         self.root.lift()
+        # Windows refuses focus to background processes; a brief topmost brings the window forward.
+        self.root.attributes('-topmost', True)
+        self.root.after(200, lambda: None if self.closed else self.root.attributes('-topmost', False))
+        self.root.focus_force()
 
     def close(self):
         self.closed = True
+        self.model_stop.set()
         self.recognizer.stop()
         self.discord.stop()
         self.tray.stop()
@@ -296,7 +419,11 @@ def main():
                                       creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
         if bridge_check.returncode or not json.loads(bridge_check.stdout).get('ok'):
             raise RuntimeError('Компонент Discord не прошёл проверку')
-        print(json.dumps({'ok': True, 'engines': ['vosk', 'tone'], 'ui': 'customtkinter', 'discord': True}, ensure_ascii=False))
+        print(json.dumps({'ok': True, 'version': VERSION, 'engines': ['vosk', 'tone'], 'ui': 'customtkinter', 'discord': True}, ensure_ascii=False))
+        return
+    instance = SingleInstance()
+    if not instance.primary:
+        instance.notify()
         return
     server = SubtitleServer(on_save=save_config)
     config = load_config()
@@ -309,6 +436,7 @@ def main():
         root.destroy()
         return
     window = LauncherWindow(server)
+    instance.listen(lambda: window.actions.put(window.show))
     if args.browser:
         open_browser(server.admin_url)
     window.run()

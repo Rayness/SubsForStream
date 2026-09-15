@@ -1,8 +1,9 @@
 from pathlib import Path
 import json
+import threading
 import wave
 import pytest
-from models import MODEL_CACHE, TONE_NAME, ToneDecoder
+from models import MODEL_CACHE, TONE_NAME, ToneDecoder, model_catalog
 from server import SubtitleServer
 
 
@@ -26,10 +27,37 @@ def test_native_window_build_and_thread_dispatch(monkeypatch):
         window.actions.put(lambda: called.append(True))
         window._poll()
         assert called == [True]
-        for page in ('discord', 'look', 'obs', 'live'):
+        refreshed = []
+        monkeypatch.setattr(window, '_refresh_models', lambda: refreshed.append(True))
+        for page in ('discord', 'look', 'models', 'obs', 'live'):
             window._show_page(page)
             root.update_idletasks()
             assert window.active_page == page
+        assert refreshed == [True]
+        from version import VERSION
+        import launcher
+        assert VERSION in root.title() and VERSION in window.about_button.cget('text')
+        window.about_button.invoke()
+        assert window.active_page == 'about' and window.page_title.cget('text') == 'О программе'
+        monkeypatch.setattr(launcher, 'latest_release', lambda: '99.0.0')
+        window._check_updates()
+        for _ in range(100):
+            if 'Доступна версия 99.0.0' in window.update_status:
+                break
+            threading.Event().wait(.02)
+        window._poll()
+        assert 'Доступна версия 99.0.0' in window.update_status_var.get()
+        items = [{**item, 'path': None, 'state': 'missing', 'size': 0, 'removable': False} for item in model_catalog()]
+        items[0].update(path=Path('ready'), state='ready', size=48 * 1024 ** 2, removable=True)
+        window._render_models(items)
+        state, button = window.model_rows[items[0]['name']]
+        assert state.cget('text') == 'Готова · 48 МБ' and button.cget('text') == 'Удалить'
+        assert window.model_rows[items[1]['name']][1].cget('text') == 'Скачать'
+        window.model_download = items[1]['name']
+        window._render_models(items)
+        assert window.model_rows[items[1]['name']][1].cget('text') == 'Отменить'
+        assert window.model_rows[items[0]['name']][1].cget('state') == 'disabled'
+        window.model_download = None
         window._select_theme('Неон')
         assert window._apply()
         assert window.server.config['subtitle_theme'] == 'neon'

@@ -1,8 +1,10 @@
 """Download official streaming models once, with cancellation and atomic install."""
 import os
 from pathlib import Path
+import shutil
 import tarfile
 import tempfile
+import uuid
 import zipfile
 import threading
 
@@ -11,20 +13,87 @@ _DOWNLOAD_GUARD = threading.Lock()
 
 TONE_NAME = 'sherpa-onnx-streaming-t-one-russian-2025-09-08'
 TONE_URL = f'https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/{TONE_NAME}.tar.bz2'
+TONE_FILES = ('model.onnx', 'tokens.txt')
+VOSK_FILES = ('am/final.mdl', 'conf/model.conf')
 MODEL_CACHE = Path(os.environ.get('LOCALAPPDATA', Path.home() / '.cache')) / 'SubForStream' / 'models'
 
 
 def tone_model(on_status, stop):
-    return _download_model(TONE_NAME, TONE_URL, ('model.onnx', 'tokens.txt'), on_status, stop)
+    return _download_model(TONE_NAME, TONE_URL, TONE_FILES, on_status, stop)
 
 
 def vosk_model(name, on_status, stop):
-    import vosk
-    for directory in getattr(vosk, 'MODEL_DIRS', []):
-        if directory and (Path(directory) / name / 'am' / 'final.mdl').is_file():
-            return Path(directory) / name
-    return _download_model(name, f'https://alphacephei.com/vosk/models/{name}.zip',
-                           ('am/final.mdl', 'conf/model.conf'), on_status, stop)
+    for directory in _vosk_dirs():
+        if (directory / name / 'am' / 'final.mdl').is_file():
+            return directory / name
+    return _download_model(name, _vosk_url(name), VOSK_FILES, on_status, stop)
+
+
+def _vosk_url(name):
+    return f'https://alphacephei.com/vosk/models/{name}.zip'
+
+
+def _vosk_dirs():
+    """Folders where Vosk itself looks for models, besides our own cache."""
+    try:
+        import vosk
+    except ImportError:
+        return []
+    return [Path(directory) for directory in getattr(vosk, 'MODEL_DIRS', []) if directory]
+
+
+def model_catalog():
+    from recognizer import VOSK_MODELS
+    languages = {'ru': 'русский', 'en': 'английский'}
+    sizes = {'small': 'компактная', 'large': 'полная'}
+    catalog = [{'name': name, 'title': f'Vosk · {languages[language]} · {sizes[size]}',
+                'url': _vosk_url(name), 'required': VOSK_FILES, 'vosk': True}
+               for (language, size), name in VOSK_MODELS.items()]
+    catalog.append({'name': TONE_NAME, 'title': 'T-one · русский', 'url': TONE_URL,
+                    'required': TONE_FILES, 'vosk': False})
+    return catalog
+
+
+def installed_models():
+    """State of every known model: ready, broken (partial folder) or missing, with its size on disk."""
+    external = _vosk_dirs()
+    result = []
+    for item in model_catalog():
+        path, state = None, 'missing'
+        # Same lookup order as vosk_model(): Vosk's own folders win over our cache.
+        for directory in (external if item['vosk'] else []) + [MODEL_CACHE]:
+            candidate = directory / item['name']
+            if all((candidate / file).is_file() for file in item['required']):
+                path, state = candidate, 'ready'
+                break
+            if directory == MODEL_CACHE and candidate.exists():
+                path, state = candidate, 'broken'
+        size = sum(file.stat().st_size for file in path.rglob('*') if file.is_file()) if path else 0
+        result.append({**item, 'path': path, 'state': state, 'size': size,
+                       'removable': path is not None and path.parent == MODEL_CACHE})
+    return result
+
+
+def download_model(name, on_status, stop):
+    item = next(item for item in model_catalog() if item['name'] == name)
+    return _download_model(name, item['url'], item['required'], on_status, stop)
+
+
+def delete_model(path):
+    path = Path(path)
+    if path.parent.resolve() != MODEL_CACHE.resolve() or not path.name.startswith(('vosk-model', 'sherpa-onnx')):
+        raise ValueError('Удалять можно только модели из папки SubForStream')
+    with _DOWNLOAD_GUARD:
+        lock = _DOWNLOAD_LOCKS.setdefault(path.name, threading.Lock())
+    if not lock.acquire(blocking=False):
+        raise ValueError('Модель сейчас скачивается')
+    try:
+        # Rename first: a locked file fails here and leaves the model intact.
+        trash = MODEL_CACHE / f'.delete-{uuid.uuid4().hex}'
+        path.rename(trash)
+        shutil.rmtree(trash, ignore_errors=True)
+    finally:
+        lock.release()
 
 
 def _download_model(name, url, required, on_status, stop):

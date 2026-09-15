@@ -4,6 +4,8 @@ from tkinter import ttk
 import webbrowser
 import customtkinter as ctk
 from desktop_select import Select
+from models import model_catalog
+from version import VERSION, REPO_URL, RELEASES_URL, ISSUES_URL
 
 BG, CARD, TEXT, DIM, ACCENT = '#0c1018', '#151c28', '#edf2fa', '#93a1b7', '#8175f5'
 EDGE, INPUT, GREEN = '#293347', '#0f1520', '#59d9ad'
@@ -58,7 +60,7 @@ class DesktopUI:
         side.grid(row=0, column=0, sticky='nsew')
         side.grid_propagate(False)
         side.grid_columnconfigure(0, weight=1)
-        side.grid_rowconfigure(7, weight=1)
+        side.grid_rowconfigure(8, weight=1)
         brand = ctk.CTkFrame(side, fg_color='transparent')
         brand.grid(row=0, column=0, sticky='ew', padx=22, pady=(30, 32))
         self._label(brand, 'S / S', 26, ACCENT, True).pack(anchor='w')
@@ -68,6 +70,7 @@ class DesktopUI:
         titles = [('live', '◉   Микрофон', 'Микрофон', 'Ваш голос — в субтитрах, прямо во время разговора.'),
                   ('discord', '◎   Discord', 'Участники Discord', 'Отдельный голос. Отдельная реплика. Свой цвет.'),
                   ('look', '▧   Оформление', 'Оформление субтитров', 'Подберите стиль, который подходит вашему стриму.'),
+                  ('models', '▣   Модели', 'Модели распознавания', 'Что уже скачано и сколько места занимает на диске.'),
                   ('obs', '↗   Подключение OBS', 'Подключение OBS', 'Один источник браузера для всех ваших субтитров.')]
         self.nav_buttons, self.pages = {}, {}
         main = ctk.CTkFrame(self.root, fg_color=BG, corner_radius=0)
@@ -98,17 +101,26 @@ class DesktopUI:
             self.pages[key] = page
             self.page_info[key] = (title, subtitle)
         self.mic_badge = self._label(side, '●  Микрофон выключен', 12, DIM)
-        self.mic_badge.grid(row=8, column=0, sticky='w', padx=22, pady=5)
+        self.mic_badge.grid(row=9, column=0, sticky='w', padx=22, pady=5)
         self.discord_badge = self._label(side, '●  Discord отключён', 12, DIM)
-        self.discord_badge.grid(row=9, column=0, sticky='w', padx=22, pady=5)
+        self.discord_badge.grid(row=10, column=0, sticky='w', padx=22, pady=5)
         self.donate_button = self._button(side, '♡  Поддержать проект', lambda: webbrowser.open(DONATION_URL), width=180)
         self.donate_button.configure(fg_color='#332821', hover_color='#4a3528', text_color='#ffc698')
-        self.donate_button.grid(row=10, column=0, padx=14, pady=(18, 0))
-        self._label(side, 'Локально · Без подписки', 11, DIM).grid(row=11, column=0, sticky='w', padx=22, pady=(12, 20))
+        self.donate_button.grid(row=11, column=0, padx=14, pady=(18, 0))
+        self.about_button = ctk.CTkButton(side, text=f'v{VERSION}  ·  О программе', command=lambda: self._show_page('about'),
+                                          fg_color='transparent', hover_color=EDGE, text_color=DIM, anchor='w',
+                                          height=30, width=180, font=('Segoe UI', 11))
+        self.about_button.grid(row=12, column=0, padx=14, pady=(8, 16))
+        # Reached from the sidebar footer rather than the main navigation list.
+        self.pages['about'] = ctk.CTkScrollableFrame(self.page_host, fg_color=BG, corner_radius=0,
+                                                     scrollbar_button_color=EDGE, scrollbar_button_hover_color=DIM)
+        self.page_info['about'] = ('О программе', f'SubForStream {VERSION} · живые субтитры для OBS')
         self._build_live(self.pages['live'])
         self._build_discord(self.pages['discord'])
         self._build_settings(self.pages['look'])
+        self._build_models(self.pages['models'])
         self._build_connect(self.pages['obs'])
+        self._build_about(self.pages['about'])
         self._show_page('live')
 
     def _show_page(self, key):
@@ -117,12 +129,15 @@ class DesktopUI:
             select.close_popup()
         for name, page in self.pages.items():
             page.grid_forget()
-            self.nav_buttons[name].configure(fg_color='#302c50' if name == key else 'transparent',
-                                             text_color='#c7bfff' if name == key else DIM)
+            button = self.nav_buttons.get(name, self.about_button)
+            button.configure(fg_color='#302c50' if name == key else 'transparent',
+                             text_color='#c7bfff' if name == key else DIM)
         self.pages[key].grid(row=0, column=0, sticky='nsew')
         self.page_title.configure(text=self.page_info[key][0])
         self.page_subtitle.configure(text=self.page_info[key][1])
         self.active_page = key
+        if key == 'models':
+            self._refresh_models()
 
     def _field(self, parent, row, label, key, values=None, limits=None):
         parent.grid_columnconfigure(1, weight=1)
@@ -271,6 +286,63 @@ class DesktopUI:
             self.config_vars[key] = var
             ctk.CTkSwitch(frame, text=title, variable=var, progress_color=ACCENT, fg_color=EDGE,
                            button_color=TEXT, font=('Segoe UI', 13)).grid(row=i//2, column=i%2, sticky='w', padx=(0, 35), pady=10)
+
+    def _build_models(self, page):
+        card = self._card(page, 'Скачанные модели',
+                          'Модель скачивается один раз при первом запуске движка. Здесь её можно скачать заранее или удалить, чтобы освободить место.')
+        table = self._fields(card)
+        table.grid_columnconfigure(0, weight=1)
+        self.model_rows = {}
+        for row, item in enumerate(model_catalog()):
+            info = ctk.CTkFrame(table, fg_color='transparent')
+            info.grid(row=row, column=0, sticky='w', pady=9)
+            self._label(info, item['title'], 14, bold=True).pack(anchor='w')
+            self._label(info, item['name'], 11, DIM).pack(anchor='w')
+            state = self._label(table, 'Проверка…', 12, DIM, anchor='e')
+            state.grid(row=row, column=1, sticky='e', padx=16)
+            button = self._button(table, 'Скачать', lambda n=item['name']: self._model_action(n), width=110, state='disabled')
+            button.grid(row=row, column=2, sticky='e')
+            self.model_rows[item['name']] = (state, button)
+        self.model_status_var = tk.StringVar(value=self.model_status)
+        self._label(card, textvariable=self.model_status_var, size=12, color=DIM, wraplength=680,
+                    justify='left').pack(anchor='w', pady=(14, 0))
+        actions = ctk.CTkFrame(card, fg_color='transparent')
+        actions.pack(fill='x', pady=(12, 0))
+        self._button(actions, 'Открыть папку ↗', self._open_models, width=160).pack(side='left')
+        self._button(actions, 'Обновить', self._refresh_models, width=110).pack(side='left', padx=10)
+        self.models_total = tk.StringVar()
+        self._label(actions, textvariable=self.models_total, size=13, color=DIM).pack(side='right')
+
+    def _build_about(self, page):
+        intro = self._card(page, 'SubForStream')
+        self._label(intro, f'Версия {VERSION}', 26, ACCENT, True).pack(anchor='w', pady=(2, 6))
+        self._label(intro, 'Бесплатные живые субтитры для OBS. Речь распознаётся на вашем компьютере, без подписок и API-ключей.',
+                    13, DIM, wraplength=680, justify='left').pack(anchor='w', pady=(0, 16))
+        buttons = ctk.CTkFrame(intro, fg_color='transparent')
+        buttons.pack(fill='x')
+        self.update_button = self._button(buttons, 'Проверить обновления', self._check_updates, True, width=200)
+        self.update_button.pack(side='left')
+        self._button(buttons, 'Страница загрузки ↗', lambda: webbrowser.open(RELEASES_URL), width=180).pack(side='left', padx=10)
+        self.update_status_var = tk.StringVar(value=self.update_status)
+        self._label(intro, textvariable=self.update_status_var, size=12, color=DIM, wraplength=680,
+                    justify='left').pack(anchor='w', pady=(12, 0))
+        links = self._card(page, 'Проект', 'Исходный код открыт. Звезда на GitHub помогает другим стримерам найти программу.')
+        row = ctk.CTkFrame(links, fg_color='transparent')
+        row.pack(fill='x', pady=(4, 0))
+        for text, url in [('GitHub ↗', REPO_URL), ('Сообщить об ошибке ↗', ISSUES_URL), ('Поддержать проект ↗', DONATION_URL)]:
+            self._button(row, text, lambda u=url: webbrowser.open(u), width=170).pack(side='left', padx=(0, 10))
+        files = self._card(page, 'Где хранятся данные')
+        table = self._fields(files)
+        for i, (title, path, opener) in enumerate([('Настройки', self.config_path, self._open_config_folder),
+                                                   ('Модели', self.models_path, self._open_models)]):
+            table.grid_columnconfigure(1, weight=1)
+            self._label(table, title, 13, DIM).grid(row=i, column=0, sticky='w', padx=(0, 20), pady=8)
+            self._label(table, str(path), 12, anchor='w', wraplength=460, justify='left').grid(row=i, column=1, sticky='ew', pady=8)
+            self._button(table, 'Открыть', opener, width=90).grid(row=i, column=2, padx=(10, 0))
+        credits = self._card(page, 'Благодарности', 'SubForStream построен на открытых проектах:')
+        self._label(credits, 'Vosk (Alpha Cephei) · T-one (VoiceKit) · sherpa-onnx (k2-fsa) · CustomTkinter · '
+                             'Flask-SocketIO · Socket.IO · discord.js · Node.js',
+                    12, TEXT, wraplength=680, justify='left').pack(anchor='w', pady=(4, 0))
 
     def _build_connect(self, page):
         source = self._card(page, 'Адрес вашего оверлея', 'Вставьте его в источник «Браузер» в OBS Studio.')
