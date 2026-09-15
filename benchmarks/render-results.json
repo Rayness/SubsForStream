@@ -1,0 +1,12 @@
+{
+  "baseline": {
+    "samples": 8,
+    "fully_visible_ms_median": 579.95,
+    "fully_visible_ms_max": 580.1
+  },
+  "optimized": {
+    "samples": 8,
+    "fully_visible_ms_median": 3.45,
+    "fully_visible_ms_max": 5.3
+  }
+}

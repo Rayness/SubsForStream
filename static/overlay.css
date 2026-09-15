@@ -1,0 +1,48 @@
+:root {
+  --font-size:44px; --font-color:#fff; --font-family:'Segoe UI'; --weight:700;
+  --style:normal; --decoration:none; --align:center; --width:90%;
+  --bg:rgba(0,0,0,.35); --shadow:0 2px 3px #000,0 0 4px #000;
+}
+* { box-sizing:border-box; }
+html, body { margin:0; width:100%; height:100%; background:transparent; overflow:hidden; }
+body { display:flex; justify-content:center; align-items:flex-end; padding:30px 40px; font-family:var(--font-family),sans-serif; }
+body[data-position="top"] { align-items:flex-start; }
+body[data-position="center"] { align-items:center; }
+#captions { display:flex; flex-direction:column; gap:14px; width:var(--width); max-height:100%; --visible-count:1; }
+.caption { position:relative; flex:0 1 auto; min-height:0; padding:14px 24px; border-radius:12px; background:var(--bg); color:var(--font-color); overflow:visible; }
+.caption-text { font-size:min(var(--font-size),calc((100vh - 80px) / (var(--visible-count) * 4))); font-weight:var(--weight); font-style:var(--style); text-decoration:var(--decoration); text-align:var(--align); text-shadow:var(--shadow); line-height:1.28; overflow-wrap:anywhere; display:-webkit-box; -webkit-line-clamp:3; -webkit-box-orient:vertical; overflow:hidden; }
+#captions.many .caption-text { -webkit-line-clamp:2; }
+.speaker { display:flex; gap:9px; align-items:center; margin-bottom:7px; font:700 15px/1.2 'Segoe UI',sans-serif; letter-spacing:.03em; color:var(--speaker); text-shadow:0 1px 3px #0008; }
+.speaker-dot { width:8px; height:8px; border-radius:50%; background:currentColor; flex:none; }
+.speaker-name { overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
+body.hide-speakers .speaker { display:none; }
+.caption.out { opacity:0; pointer-events:none; }
+body[data-anim="fade"] .caption.out { transition:opacity .15s ease; }
+body[data-anim="slide-left"] .caption.out { transform:translateX(-35px); transition:opacity .15s,transform .15s; }
+body[data-anim="slide-right"] .caption.out { transform:translateX(35px); transition:opacity .15s,transform .15s; }
+/* Entrance and text revisions always render immediately; animation is exit-only. */
+body[data-theme="dialogue"] .caption, body.legacy-bubble .caption { border-radius:26px; border:1px solid color-mix(in srgb,var(--speaker) 45%,transparent); box-shadow:0 10px 25px #0003; }
+body[data-theme="dialogue"] .caption { width:88%; align-self:flex-start; background:linear-gradient(130deg,color-mix(in srgb,var(--speaker) 18%,#111827),#111827e8); }
+body[data-theme="dialogue"] .caption.self { align-self:flex-end; }
+body[data-theme="dialogue"] .caption::after, body.legacy-bubble .caption::after { content:''; position:absolute; left:24px; bottom:-9px; border:10px solid transparent; border-top-color:#111827; border-bottom:0; }
+body[data-theme="dialogue"] .caption.self::after { left:auto; right:24px; }
+body.legacy-bubble .caption::after { border-top-color:var(--bg); }
+body[data-theme="glass"] .caption { background:linear-gradient(115deg,#192237e8,#27304caa); border:1px solid #ffffff32; border-left:4px solid var(--speaker); border-radius:18px; box-shadow:0 10px 35px #0004,inset 0 1px #ffffff18; }
+body[data-theme="glass"] .speaker { color:var(--speaker); }
+body[data-theme="neon"] .caption { background:#080c19ed; border:1px solid var(--speaker); border-radius:16px; box-shadow:0 0 14px color-mix(in srgb,var(--speaker) 30%,transparent),inset 0 0 18px #ffffff05; }
+body[data-theme="neon"] .speaker { text-transform:uppercase; font-size:13px; letter-spacing:.14em; }
+body[data-theme="comic"] .caption { border:3px solid var(--speaker); border-radius:24px 24px 24px 5px; background:#182033f5; box-shadow:6px 6px 0 #060913c9; }
+body[data-theme="comic"] .speaker { color:#111827; background:var(--speaker); display:inline-flex; border-radius:5px; padding:5px 10px; text-shadow:none; transform:rotate(-1deg); }
+body[data-theme="comic"] .speaker-dot { display:none; }
+body[data-theme="minimal"] .caption { background:linear-gradient(90deg,#060913c7,#06091332); border-radius:0; border-left:3px solid var(--speaker); padding:8px 18px; }
+body[data-theme="minimal"] .speaker { font-size:12px; margin-bottom:4px; }
+/* Fit several long captions without overflowing the background of a card. */
+#captions.many { gap:8px; }
+#captions.many .caption { padding:8px 14px; }
+#captions.many .speaker { font-size:12px; line-height:1.1; margin-bottom:4px; }
+#captions.many .caption-text { font-size:min(var(--font-size),calc(((100vh - 80px) / var(--visible-count) - 48px) / 2.56)); }
+body[data-theme="comic"] #captions.many .speaker { padding:2px 6px; }
+@media(max-height:800px) {
+  #captions.many .caption-text { -webkit-line-clamp:1; font-size:min(var(--font-size),calc(((100vh - 80px) / var(--visible-count) - 48px) / 1.28)); }
+}
+@media(max-width:800px) { body { padding:16px; } #captions { gap:10px; } .caption { padding:10px 16px; } .speaker { font-size:12px; } }

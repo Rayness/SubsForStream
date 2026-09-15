@@ -1,508 +1,318 @@
-"""
-SubForStream Launcher — нативный запускатель.
-
-Движок: tkinter (встроен в Python, без дополнительных зависимостей).
-
-Режимы запуска:
-  python launcher.py              — нативное окно + трей
-  python launcher.py --browser    — только трей, панель в браузере
-"""
-
+"""SubForStream: native control panel and optional browser recognition."""
 import argparse
-import json
+from collections import deque
 import os
+from pathlib import Path
+import queue
 import shutil
 import subprocess
 import sys
 import threading
 import tkinter as tk
-from tkinter import ttk
+from tkinter import colorchooser, messagebox
+import customtkinter as ctk
+from desktop_ui import DesktopUI, THEMES, CHOICES, BG, CARD, TEXT, DIM, ACCENT, GREEN
 import webbrowser
 
-from PIL import Image, ImageTk
+from PIL import Image
 import pystray
-
+from recognizer import SpeechRecognizer
+from discord_capture import DiscordCapture
 from server import SubtitleServer
-
-# ─── Config ───────────────────────────────────────────────────────────────────
-
-CONFIG_FILE = "config.json"
+from settings import BASE_DIR, load_config, save_config
 
 
-def _resource(name: str) -> str:
-    """Путь к файлу ресурса — корректно работает и в .py, и в PyInstaller exe."""
-    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
-    return os.path.join(base, name)
 
-DEFAULT_CONFIG: dict = {
-    "language":      "ru",
-    "port":          5000,
-    "font_size":     44,
-    "fade_delay":    5,
-    "font_family":   "Segoe UI",
-    "font_color":    "#ffffff",
-    "font_bold":     True,
-    "font_italic":   False,
-    "font_underline": False,
-    "bg_color":      "#000000",
-    "bg_opacity":    35,
-    "censor":        False,
-    "anim_type":     "fade",
-    "bubble_style":  False,
-    "position":      "bottom",
-    "text_align":    "center",
-    "text_shadow":   True,
-    "max_width":     90,
-}
-
-# ─── Цвета темы ───────────────────────────────────────────────────────────────
-
-BG       = "#0f0f13"
-CARD     = "#18181f"
-BORDER   = "#2a2a35"
-ACCENT   = "#3a86ff"
-ACCENT2  = "#2563eb"
-SUCCESS  = "#22c55e"
-TEXT     = "#e0e0e0"
-TEXT_DIM = "#888888"
-TEXT_URL = "#a0c4ff"
+def resource(name):
+    return Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent)) / name
 
 
-# ─── Helpers ──────────────────────────────────────────────────────────────────
-
-def _load_config() -> dict:
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE, encoding="utf-8") as f:
-                return {**DEFAULT_CONFIG, **json.load(f)}
-        except Exception:
-            pass
-    return DEFAULT_CONFIG.copy()
-
-
-def _save_config(cfg: dict) -> None:
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2, ensure_ascii=False)
-
-
-def _make_icon() -> Image.Image:
-    try:
-        return Image.open(_resource("icon.png")).resize((64, 64), Image.LANCZOS).convert("RGBA")
-    except Exception:
-        size = 64
-        img  = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-        from PIL import ImageDraw
-        draw = ImageDraw.Draw(img)
-        draw.ellipse((4, 4, size - 4, size - 4), fill=(58, 134, 255, 255))
-        cx = size // 2
-        draw.rectangle((cx - 6, 14, cx + 6, 36), fill=(255, 255, 255, 255))
-        draw.arc((cx - 12, 26, cx + 12, 46), start=0, end=180, fill=(255, 255, 255, 255), width=3)
-        draw.line((cx, 46, cx, 52), fill=(255, 255, 255, 255), width=3)
-        return img
-
-
-def _find_browser_exe() -> str | None:
-    candidates = [
-        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-    ]
-    for p in candidates:
-        if os.path.exists(p):
-            return p
-    return shutil.which("chrome") or shutil.which("msedge")
-
-
-def _open_app(url: str, browser_exe: str | None) -> None:
-    if browser_exe:
-        subprocess.Popen([browser_exe, f"--app={url}", "--window-size=1100,680", "--disable-extensions"])
+def open_browser(url):
+    candidates = [Path(os.environ.get('PROGRAMFILES', 'C:/Program Files')) / 'Google/Chrome/Application/chrome.exe',
+                  Path(os.environ.get('LOCALAPPDATA', '.')) / 'Google/Chrome/Application/chrome.exe',
+                  Path(os.environ.get('PROGRAMFILES(X86)', 'C:/Program Files (x86)')) / 'Microsoft/Edge/Application/msedge.exe']
+    browser = next((str(p) for p in candidates if p.exists()), None) or shutil.which('chrome') or shutil.which('msedge')
+    if browser:
+        subprocess.Popen([browser, f'--app={url}', '--window-size=1100,760'])
     else:
         webbrowser.open(url)
 
 
-# ─── Нативное окно (tkinter) ──────────────────────────────────────────────────
-
-class LauncherWindow:
-    def __init__(self, cfg: dict, server: SubtitleServer, browser_exe: str | None):
-        self._cfg         = cfg
-        self._server      = server
-        self._browser_exe = browser_exe
-
-        self._root = tk.Tk()
-        self._root.title("SubForStream")
-        self._root.configure(bg=BG)
-        self._root.resizable(True, True)
-        self._root.geometry("620x760")
-        self._root.minsize(480, 520)
-        self._root.protocol("WM_DELETE_WINDOW", self._on_close)
-
-        # Иконка окна
+class LauncherWindow(DesktopUI):
+    def __init__(self, server):
+        self.server = server
+        ctk.set_appearance_mode('dark')
+        self.root = ctk.CTk()
+        self.root.title('SubForStream — субтитры для OBS')
+        self.root.geometry('1160x840')
+        self.root.minsize(960, 680)
+        self.root.configure(fg_color=BG)
         try:
-            icon_img = Image.open(_resource("icon.png")).resize((32, 32), Image.LANCZOS)
-            self._tk_icon = ImageTk.PhotoImage(icon_img)
-            self._root.iconphoto(True, self._tk_icon)
-        except Exception:
+            self.root.iconbitmap(str(resource('icon.ico')))
+        except tk.TclError:
             pass
-
-        # Скрыть в трей при закрытии — иконка управляет через tray
-        self._hidden = False
-
+        self.root.protocol('WM_DELETE_WINDOW', self.root.withdraw)
+        self.events = deque(maxlen=200)
+        self.actions = queue.SimpleQueue()
+        self.closed = False
+        self.pending_text = None
+        self.status = 'Готово • выберите микрофон и нажмите «Начать»'
+        self.recognizer = SpeechRecognizer(self._on_text, self._on_status)
+        server._on_caption = self._on_caption
+        self.discord_status = 'Не подключён'
+        self.discord = DiscordCapture(server, lambda message: setattr(self, 'discord_status', message))
+        self._participant_text = {}
+        self._participant_rows = None
+        self._ui_running = None
+        self.config_vars = {}
+        self.devices = {'По умолчанию': None}
+        self._style()
         self._build()
-        self._center()
+        self._create_tray()
+        self.root.after(40, self._poll)
+        threading.Thread(target=self._devices, daemon=True).start()
 
-    # ── Построение UI ─────────────────────────────────────────────────────────
 
-    def _build(self) -> None:
-        root = self._root
 
-        # ── Скроллируемый контейнер ──
-        wrapper = tk.Frame(root, bg=BG)
-        wrapper.pack(fill="both", expand=True)
 
-        self._canvas = tk.Canvas(wrapper, bg=BG, highlightthickness=0, bd=0)
-        scrollbar = ttk.Scrollbar(wrapper, orient="vertical", command=self._canvas.yview)
-        self._canvas.configure(yscrollcommand=scrollbar.set)
 
-        scrollbar.pack(side="right", fill="y")
-        self._canvas.pack(side="left", fill="both", expand=True)
 
-        self._scroll_frame = tk.Frame(self._canvas, bg=BG)
-        self._scroll_win = self._canvas.create_window((0, 0), window=self._scroll_frame, anchor="nw")
 
-        self._scroll_frame.bind("<Configure>", self._on_frame_configure)
-        self._canvas.bind("<Configure>", self._on_canvas_configure)
-        self._canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+    def _color(self, key):
+        color = colorchooser.askcolor(self.config_vars[key].get(), parent=self.root)[1]
+        if color:
+            self.config_vars[key].set(color)
 
-        # ── Содержимое ──
-        self._build_content(self._scroll_frame)
+    def _copy(self, text):
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
 
-    def _build_content(self, root: tk.Frame) -> None:
-        # ── Заголовок ──
-        hdr = tk.Frame(root, bg=BG)
-        hdr.pack(fill="x", padx=28, pady=(28, 0))
-
+    def _apply(self):
         try:
-            raw = Image.open(_resource("icon.png")).resize((48, 48), Image.LANCZOS)
-            self._hdr_icon = ImageTk.PhotoImage(raw)
-            tk.Label(hdr, image=self._hdr_icon, bg=BG).pack(side="left")
-        except Exception:
-            tk.Label(hdr, text="🎤", font=("Segoe UI", 28), bg=BG).pack(side="left")
+            data = {key: var.get() for key, var in self.config_vars.items()}
+            for key in ('port', 'font_size', 'bg_opacity', 'max_width', 'max_speakers', 'discord_limit'):
+                data[key] = int(data[key])
+            data['fade_delay'] = float(data['fade_delay'])
+            data['subtitle_theme'] = THEMES[data['subtitle_theme']]
+            for key, choices in CHOICES.items():
+                data[key] = choices[data[key]]
+            data['mic_index'] = self.devices[self.mic_var.get()]
+            self.server.save_settings(data)
+            self.settings_note.set('Сохранено ✓  Для смены модели перезапустите распознавание.')
+            return True
+        except (ValueError, OSError, tk.TclError, KeyError) as exc:
+            messagebox.showerror('Настройки', str(exc), parent=self.root)
+            return False
 
-        title_frame = tk.Frame(hdr, bg=BG)
-        title_frame.pack(side="left", padx=(12, 0))
-        tk.Label(title_frame, text="SubForStream", font=("Segoe UI", 20, "bold"),
-                 fg=TEXT, bg=BG).pack(anchor="w")
-        tk.Label(title_frame, text="Субтитры для OBS в реальном времени",
-                 font=("Segoe UI", 11), fg=TEXT_DIM, bg=BG).pack(anchor="w")
-
-        # ── Карточка: подключение ──
-        self._card("Адреса подключения", self._build_urls, pady_top=20)
-
-        # ── Карточка: порт ──
-        self._card("Порт сервера", self._build_port, pady_top=12)
-
-        # ── Карточка: инструкция OBS ──
-        self._card("Инструкция по установке в OBS", self._build_steps, pady_top=12)
-
-        # ── Кнопки запуска ──
-        btn_frame = tk.Frame(root, bg=BG)
-        btn_frame.pack(fill="x", padx=28, pady=(16, 28))
-        self._make_btn(btn_frame, "  Открыть панель управления",
-                       self._open_admin, accent=True).pack(fill="x", pady=(0, 8))
-        self._make_btn(btn_frame, "  Открыть в браузере",
-                       self._open_browser).pack(fill="x")
-
-    def _on_frame_configure(self, _event=None) -> None:
-        self._canvas.configure(scrollregion=self._canvas.bbox("all"))
-
-    def _on_canvas_configure(self, event) -> None:
-        self._canvas.itemconfig(self._scroll_win, width=event.width)
-        # Обновить wraplength для описаний шагов
-        wrap = max(200, event.width - 120)
-        for lbl in self._step_labels:
-            lbl.configure(wraplength=wrap)
-
-    def _on_mousewheel(self, event) -> None:
-        self._canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-
-    def _card(self, title: str, builder, pady_top: int = 12) -> None:
-        outer = tk.Frame(self._scroll_frame, bg=BG)
-        outer.pack(fill="x", padx=28, pady=(pady_top, 0))
-
-        tk.Label(outer, text=title, font=("Segoe UI", 11, "bold"),
-                 fg=TEXT, bg=BG).pack(anchor="w", pady=(0, 8))
-
-        card = tk.Frame(outer, bg=CARD, highlightbackground=BORDER,
-                        highlightthickness=1, bd=0)
-        card.pack(fill="x")
-
-        inner = tk.Frame(card, bg=CARD)
-        inner.pack(fill="x", padx=16, pady=14)
-        builder(inner)
-
-    def _build_urls(self, parent: tk.Frame) -> None:
-        obs_url   = self._server.admin_url.replace("/admin", "/")
-        admin_url = self._server.admin_url
-        self._url_row(parent, "Overlay для OBS Browser Source", obs_url)
-        sep = tk.Frame(parent, bg=BORDER, height=1)
-        sep.pack(fill="x", pady=10)
-        self._url_row(parent, "Панель управления", admin_url)
-
-    def _url_row(self, parent: tk.Frame, label: str, url: str) -> None:
-        tk.Label(parent, text=label, font=("Segoe UI", 10),
-                 fg=TEXT_DIM, bg=CARD).pack(anchor="w")
-        row = tk.Frame(parent, bg=CARD)
-        row.pack(fill="x", pady=(4, 0))
-
-        var = tk.StringVar(value=url)
-        entry = tk.Entry(row, textvariable=var, state="readonly",
-                         font=("Consolas", 11), fg=TEXT_URL, bg="#0f0f13",
-                         readonlybackground="#0f0f13",
-                         relief="flat", bd=0,
-                         highlightbackground=BORDER, highlightthickness=1)
-        entry.pack(side="left", fill="x", expand=True, ipady=7, ipadx=8)
-
-        btn = self._make_btn(row, "Копировать", lambda u=url: self._copy(u, btn))
-        btn.pack(side="left", padx=(8, 0))
-
-    def _build_port(self, parent: tk.Frame) -> None:
-        row = tk.Frame(parent, bg=CARD)
-        row.pack(fill="x")
-
-        self._port_var = tk.StringVar(value=str(self._cfg.get("port", 5000)))
-        entry = tk.Entry(row, textvariable=self._port_var, width=8,
-                         font=("Segoe UI", 13), fg=TEXT, bg="#0f0f13",
-                         insertbackground=TEXT, relief="flat", bd=0,
-                         highlightbackground=BORDER, highlightthickness=1)
-        entry.pack(side="left", ipady=7, ipadx=8)
-
-        self._make_btn(row, "Сохранить", self._save_port, accent=True).pack(side="left", padx=(10, 0))
-
-        self._port_note = tk.Label(row, text="", font=("Segoe UI", 10),
-                                   fg=TEXT_DIM, bg=CARD)
-        self._port_note.pack(side="left", padx=(12, 0))
-
-    def _build_steps(self, parent: tk.Frame) -> None:
-        self._step_labels: list[tk.Label] = []
-        steps = [
-            ("Запусти SubForStream",
-             "Убедись что приложение запущено — иконка есть в системном трее."),
-            ("OBS → Источники → \"+\"",
-             "Внизу панели «Источники» нажми + и выбери «Браузер»."),
-            ("Вставь URL Overlay",
-             "В поле URL вставь адрес «Overlay для OBS Browser Source» выше."),
-            ("Установи размеры",
-             "Ширина: 1920, Высота: 1080 (должно совпадать с разрешением сцены)."),
-            ("Нажми OK и растяни на весь экран",
-             "Источник появится в сцене. Alt+перетаскивание для обрезки краёв."),
-            ("Открой панель и начни запись",
-             "Нажми «Открыть панель управления», кликни «Начать» — субтитры появятся в OBS."),
-        ]
-        for i, (title, desc) in enumerate(steps):
-            self._step(parent, i + 1, title, desc)
-
-    def _step(self, parent: tk.Frame, num: int, title: str, desc: str) -> None:
-        row = tk.Frame(parent, bg=CARD)
-        row.pack(fill="x", pady=(0, 10))
-
-        num_canvas = tk.Canvas(row, width=28, height=28, bg=CARD, highlightthickness=0)
-        num_canvas.create_oval(1, 1, 27, 27, outline=ACCENT, width=1)
-        num_canvas.create_text(14, 14, text=str(num), fill=ACCENT,
-                               font=("Segoe UI", 10, "bold"))
-        num_canvas.pack(side="left", anchor="n", pady=2)
-
-        body = tk.Frame(row, bg=CARD)
-        body.pack(side="left", fill="x", expand=True, padx=(10, 0))
-        tk.Label(body, text=title, font=("Segoe UI", 11, "bold"),
-                 fg=TEXT, bg=CARD, anchor="w").pack(fill="x")
-        lbl = tk.Label(body, text=desc, font=("Segoe UI", 10),
-                       fg=TEXT_DIM, bg=CARD, anchor="w", wraplength=420, justify="left")
-        lbl.pack(fill="x")
-        self._step_labels.append(lbl)
-
-    # ── Кнопки / утилиты ──────────────────────────────────────────────────────
-
-    def _make_btn(self, parent, text: str, command, accent: bool = False) -> tk.Label:
-        """Кнопка на базе tk.Label с hover-эффектом."""
-        bg_normal = ACCENT if accent else CARD
-        bg_hover  = ACCENT2 if accent else BORDER
-        fg_normal = "#fff" if accent else TEXT_DIM
-
-        btn = tk.Label(parent, text=text,
-                       font=("Segoe UI", 10, "bold" if accent else "normal"),
-                       fg=fg_normal, bg=bg_normal,
-                       padx=14, pady=8, cursor="hand2")
-        btn.bind("<Button-1>", lambda _: command())
-        btn.bind("<Enter>",    lambda _: btn.configure(bg=bg_hover, fg="#fff"))
-        btn.bind("<Leave>",    lambda _: btn.configure(bg=bg_normal, fg=fg_normal))
-        return btn
-
-    def _copy(self, text: str, btn: tk.Label) -> None:
-        self._root.clipboard_clear()
-        self._root.clipboard_append(text)
-        old_text = btn.cget("text")
-        btn.configure(text="Скопировано!", bg=SUCCESS)
-        self._root.after(2000, lambda: btn.configure(text=old_text, bg=CARD))
-
-    def _save_port(self) -> None:
+    def _devices(self):
         try:
-            port = int(self._port_var.get())
-            assert 1024 <= port <= 65535
-        except Exception:
-            self._port_note.configure(text="Неверный порт (1024–65535)", fg="#ef4444")
+            import sounddevice as sd
+            devices = {f'{i}: {d["name"]}': i for i, d in enumerate(sd.query_devices()) if d['max_input_channels'] > 0}
+            self.actions.put(lambda: self._set_devices(devices))
+        except Exception as exc:
+            self._on_status(f'Не удалось получить микрофоны: {exc}')
+
+    def _set_devices(self, devices):
+        self.devices.update(devices)
+        self.mic.configure(values=list(self.devices))
+        index = self.server.config.get('mic_index')
+        self.mic_var.set(next((name for name, value in self.devices.items() if value == index), 'По умолчанию'))
+
+    def _toggle(self):
+        if self.recognizer.running:
+            self.recognizer.stop()
+            self._on_status('Остановка…')
+        elif self._apply():
+            if not self.server.claim_source('native'):
+                self._on_status('Сначала остановите распознавание в браузере.')
+                return
+            self.recognizer.start(self.server.config)
+
+    def _browser(self):
+        if self.recognizer.running:
+            self._on_status('Сначала остановите локальный микрофон, затем откройте браузерный режим.')
             return
-        self._cfg["port"] = port
-        _save_config(self._cfg)
-        self._port_note.configure(
-            text="Сохранено. Перезапусти приложение.", fg=TEXT_DIM)
+        self.server.release_source('native')
+        open_browser(self.server.admin_url)
 
-    def _open_admin(self) -> None:
-        _open_app(self._server.admin_url, self._browser_exe)
+    def _clear(self):
+        self.server.emit_clear()
+        self.preview.set('')
 
-    def _open_browser(self) -> None:
-        webbrowser.open(self._server.admin_url)
 
-    def _center(self) -> None:
-        self._root.update_idletasks()
-        w = self._root.winfo_width()
-        h = self._root.winfo_height()
-        sw = self._root.winfo_screenwidth()
-        sh = self._root.winfo_screenheight()
-        self._root.geometry(f"{w}x{h}+{(sw-w)//2}+{(sh-h)//2}")
+    def _toggle_discord(self):
+        if self.discord.running:
+            self.discord.stop()
+            self.discord_status = 'Отключение Discord…'
+        elif self._apply():
+            try:
+                cfg = self.server.config
+                self.discord.start(self.discord_token.get(), cfg['discord_channel_id'], cfg['discord_ignore_id'], cfg)
+            except ValueError as exc:
+                messagebox.showerror('Discord', str(exc), parent=self.root)
 
-    def _on_close(self) -> None:
-        self._root.withdraw()
-        self._hidden = True
+    def _demo(self):
+        if not self._apply():
+            return
+        for key, name, color, text in [('self', self.server.config['speaker_name'], '#60a5fa', 'Проверяем субтитры — всем привет!'), ('preview:anna', 'Анна', '#a78bfa', 'Привет! Теперь видно, кто говорит.'), ('preview:max', 'Макс', '#34d399', 'А мой текст остаётся отдельным облачком.')]:
+            self.server._sio.emit('subtitle', {'text': text, 'speaker': {'id': key, 'name': name, 'color': color}})
 
-    def show(self) -> None:
-        self._root.deiconify()
-        self._root.lift()
-        self._hidden = False
+    def _on_caption(self, packet):
+        speaker = packet['speaker']
+        if speaker['id'] == 'self':
+            self._on_transcript(packet['text'], False)
+        else:
+            self._participant_text[speaker['id']] = packet['text']
+        if packet.get('final'):
+            self.events.append(f"{speaker['name']}: {packet['text']}")
 
-    def destroy(self) -> None:
+    def _on_text(self, text, final):
+        self.server.submit_transcript(text, final)
+
+    def _on_transcript(self, text, final):
+        self.pending_text = text
+        if final:
+            self.events.append(text)
+
+    def _on_status(self, message):
+        self.status = message
+
+    def _poll(self):
+        if self.closed:
+            return
+        while not self.actions.empty():
+            self.actions.get_nowait()()
+            if self.closed:
+                return
+        if self.status_var.get() != self.status:
+            self.status_var.set(self.status)
+        if self.discord_status_var.get() != self.discord_status:
+            self.discord_status_var.set(self.discord_status)
+        rows = tuple((key, name, self._participant_text.get(key, ''), drops) for key, name, drops in self.discord.participants())
+        if rows != self._participant_rows:
+            for item in self.participant_table.get_children():
+                self.participant_table.delete(item)
+            for key, name, text, drops in rows:
+                self.participant_table.insert('', 'end', iid=key, values=(name, text, drops))
+            self._participant_rows = rows
+        if not self.discord.running:
+            self._participant_text.clear()
+        if self.pending_text is not None:
+            self.preview.set(self.pending_text)
+            self.pending_text = None
+        if self.events:
+            self.log.configure(state='normal')
+            while self.events:
+                self.log.insert('end', self.events.popleft() + '\n')
+            lines = int(self.log.index('end-1c').split('.')[0])
+            if lines > 200:
+                self.log.delete('1.0', f'{lines-200}.0')
+            self.log.see('end')
+            self.log.configure(state='disabled')
+        running = self.recognizer.running
+        ui_running = (running, self.discord.running)
+        if ui_running != self._ui_running:
+            self.start_button.configure(text='■ Остановить' if running else '▶ Начать',
+                                        fg_color='#ab4562' if running else ACCENT)
+            self.mic_badge.configure(text='●  Микрофон работает' if running else '●  Микрофон выключен',
+                                     text_color=GREEN if running else DIM)
+            self.discord_badge.configure(text='●  Discord запущен' if ui_running[1] else '●  Discord отключён',
+                                         text_color=GREEN if ui_running[1] else DIM)
+            self.discord_button.configure(text='Отключить бота' if ui_running[1] else 'Подключить бота')
+            self._ui_running = ui_running
+        if running:
+            self.server.claim_source('native')
+        else:
+            self.server.release_source('native')
+        with self.server._lock:
+            values = sorted(self.server.render_ms)
+        render = f'{values[min(len(values)-1, int(len(values)*.95))]:.1f} мс' if values else 'ожидание OBS'
+        metrics = f'Очередь аудио: {self.recognizer.queue_ms:.1f} мс  •  Обработка блока: {self.recognizer.decode_ms:.1f} мс\nПодтверждение кадра OBS, p95: {render}  •  Пропущено блоков: {self.recognizer.dropped_chunks}'
+        if self.metrics.get() != metrics:
+            self.metrics.set(metrics)
+        self.root.after(40, self._poll)
+
+    def _create_tray(self):
         try:
-            self._root.destroy()
-        except Exception:
-            pass
+            icon = Image.open(resource('icon.png')).convert('RGBA').resize((64, 64))
+        except OSError:
+            icon = Image.new('RGB', (64, 64), ACCENT)
+        def show(*_):
+            self.actions.put(self.show)
+        def quit_app(*_):
+            self.actions.put(self.close)
+        self.tray = pystray.Icon('SubForStream', icon, 'SubForStream', pystray.Menu(
+            pystray.MenuItem('Открыть', show, default=True),
+            pystray.MenuItem('Очистить субтитры', lambda *_: self.server.emit_clear()),
+            pystray.MenuItem('Выход', quit_app)))
+        threading.Thread(target=self.tray.run, daemon=True).start()
 
-    def run(self) -> None:
-        self._root.mainloop()
+    def show(self):
+        self.root.deiconify()
+        self.root.lift()
 
+    def close(self):
+        self.closed = True
+        self.recognizer.stop()
+        self.discord.stop()
+        self.tray.stop()
+        self.root.destroy()
+        self.server.stop()
 
-# ─── Системный трей ───────────────────────────────────────────────────────────
-
-def _run_with_window(cfg: dict, server: SubtitleServer) -> None:
-    browser_exe = _find_browser_exe()
-    win = LauncherWindow(cfg, server, browser_exe)
-
-    def open_launcher(*_):
-        win.show()
-
-    def open_admin(*_):
-        _open_app(server.admin_url, browser_exe)
-
-    def clear_subtitle(*_):
-        server.emit_clear()
-
-    def quit_app(icon, _):
-        _save_config(cfg)
-        icon.stop()
-        win.destroy()
-        os._exit(0)
-
-    menu = pystray.Menu(
-        pystray.MenuItem("Открыть SubForStream", open_launcher),
-        pystray.MenuItem("Панель управления", open_admin),
-        pystray.MenuItem("Очистить субтитр", clear_subtitle),
-        pystray.Menu.SEPARATOR,
-        pystray.MenuItem("Выход", quit_app),
-    )
-    icon = pystray.Icon("SubForStream", _make_icon(), "SubForStream", menu)
-    threading.Thread(target=icon.run, daemon=True).start()
-
-    win.run()  # блокирует главный поток (tkinter mainloop)
+    def run(self):
+        self.root.mainloop()
 
 
-def _run_browser_only(cfg: dict, server: SubtitleServer) -> None:
-    browser_exe = _find_browser_exe()
-
-    def open_admin(*_):
-        _open_app(server.admin_url, browser_exe)
-
-    def clear_subtitle(*_):
-        server.emit_clear()
-
-    def quit_app(icon, _):
-        _save_config(cfg)
-        icon.stop()
-        os._exit(0)
-
-    menu = pystray.Menu(
-        pystray.MenuItem("Открыть SubForStream", open_admin),
-        pystray.MenuItem("Очистить субтитр", clear_subtitle),
-        pystray.Menu.SEPARATOR,
-        pystray.MenuItem("Выход", quit_app),
-    )
-    icon = pystray.Icon("SubForStream", _make_icon(), "SubForStream", menu)
-    threading.Timer(0.5, open_admin).start()
-    icon.run()  # блокирует главный поток
-
-
-# ─── Entry point ──────────────────────────────────────────────────────────────
-
-def _is_frozen() -> bool:
-    return getattr(sys, "frozen", False) or "__compiled__" in dir(sys.modules.get("__main__", object()))
-
-
-def _hide_console() -> None:
-    """Скрыть консольное окно exe — работает даже если Nuitka не убрал его флагом."""
-    if not _is_frozen():
-        return
-    try:
-        import ctypes
-        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
-        if hwnd:
-            ctypes.windll.user32.ShowWindow(hwnd, 0)  # SW_HIDE
-            ctypes.windll.kernel32.FreeConsole()
-    except Exception:
-        pass
-
-
-def _fix_stdio() -> None:
-    """В windowed exe stdout/stderr = None, что ломает Flask/werkzeug. Редиректим в лог."""
-    if not _is_frozen():
-        return
-    if sys.stdout is not None:
-        return
-    log_path = os.path.join(os.path.dirname(sys.executable), "SubForStream.log")
-    log = open(log_path, "w", encoding="utf-8", buffering=1)
-    sys.stdout = log
-    sys.stderr = log
-
-
-def main() -> None:
-    _hide_console()
-    _fix_stdio()
-    parser = argparse.ArgumentParser(description="SubForStream Launcher")
-    parser.add_argument(
-        "--browser", action="store_true",
-        help="Только трей + браузер, без нативного окна",
-    )
+def main():
+    if getattr(sys, 'frozen', False) and sys.stdout is None:
+        log = open(BASE_DIR / 'SubForStream.log', 'a', encoding='utf-8', buffering=1)
+        sys.stdout = sys.stderr = log
+    parser = argparse.ArgumentParser(description='SubForStream')
+    parser.add_argument('--browser', action='store_true', help='Также открыть браузерное распознавание')
+    parser.add_argument('--check', action='store_true', help='Проверить установку без включения микрофона')
     args = parser.parse_args()
-
-    cfg = _load_config()
-    server = SubtitleServer(
-        on_transcript=lambda *_: None,
-        on_save=_save_config,
-    )
-    server.start(cfg["port"], cfg)
-
+    if args.check:
+        import json
+        import sounddevice
+        import vosk
+        import sherpa_onnx
+        ctk.set_appearance_mode('dark')
+        root = ctk.CTk()
+        root.withdraw()
+        ctk.CTkButton(root, text='Проверка интерфейса').pack()
+        root.update_idletasks()
+        root.destroy()
+        check_server = SubtitleServer()
+        client = check_server._app.test_client()
+        for path in ('/', '/mic', '/admin', '/static/socket.io.min.js', '/static/speech.js'):
+            if client.get(path).status_code != 200:
+                raise RuntimeError(f'Проверка страницы не пройдена: {path}')
+        bridge_dir = resource('discord_bridge')
+        node = str(bridge_dir / 'node.exe') if (bridge_dir / 'node.exe').exists() else shutil.which('node')
+        if not node:
+            raise RuntimeError('Компонент Discord не найден')
+        bridge_check = subprocess.run([node, str(bridge_dir / 'bridge.cjs'), '--check'],
+                                      capture_output=True, text=True, timeout=20,
+                                      creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        if bridge_check.returncode or not json.loads(bridge_check.stdout).get('ok'):
+            raise RuntimeError('Компонент Discord не прошёл проверку')
+        print(json.dumps({'ok': True, 'engines': ['vosk', 'tone'], 'ui': 'customtkinter', 'discord': True}, ensure_ascii=False))
+        return
+    server = SubtitleServer(on_save=save_config)
+    config = load_config()
+    try:
+        server.start(config['port'], config)
+    except (OSError, SystemExit) as exc:
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror('SubForStream', f'Не удалось запустить сервер на порту {config["port"]}. Возможно, приложение уже открыто.\n{exc}')
+        root.destroy()
+        return
+    window = LauncherWindow(server)
     if args.browser:
-        _run_browser_only(cfg, server)
-    else:
-        _run_with_window(cfg, server)
+        open_browser(server.admin_url)
+    window.run()
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

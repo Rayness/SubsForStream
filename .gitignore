@@ -5,3 +5,19 @@ __pycache__
 launcher.build
 launcher.dist
 launcher.onefile-build
+.venv/
+venv/
+.pytest_cache/
+*.log
+.config-*.tmp
+node_modules/
+discord_bridge/node.exe
+/dist-multi/
+/dist-ui/
+/dist-release/
+
+# Локальные артефакты
+/SubForStream.exe
+/SubForStream.pdb
+/config.json
+nuitka-crash-report.xml

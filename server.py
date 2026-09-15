@@ -6,12 +6,18 @@ SubtitleServer — Flask + SocketIO сервер.
 """
 
 import re
-import random
+import socket
+import sys
+import time
+from collections import deque
+from functools import lru_cache
 import threading
 import logging
 from typing import Callable, Optional
+from settings import DEFAULT_CONFIG, validate_config
+from werkzeug.serving import ThreadedWSGIServer
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 from flask_socketio import SocketIO
 
 logging.getLogger("werkzeug").setLevel(logging.ERROR)
@@ -20,137 +26,10 @@ LANG_CODES = {"ru": "ru-RU", "en": "en-US"}
 
 # ─── Цензура ──────────────────────────────────────────────────────────────────
 
-_CENSOR_SYMBOLS = "!@#$%^&*"
-
-# Список русских нецензурных слов (корни, охватывают словоформы)
-_PROFANITY_PATTERNS = re.compile(
-    r"\b("
-    r"[хx][уy][йeёяию][а-яё]*|[хx][уy][яию]|[хx][уy][её]б[а-яё]*|[хx][уy][её][вw][иыьъ]?[нн]?[аяе]*"
-    r"|о[хx][уy][еёяию][а-яё]*"
-    r"|[бb][лl][яiy][дд]?[ьъ]?[а-яё]*"
-    r"|[пp][иi][зz3][дд][аеёиыьъю]?[а-яё]*"
-    r"|[пp][иi][дd][оoаa][рp][а-яё]*"
-    r"|[еeё][бb][аеёиыоуьъ]?[нт]?[ьъ]?[а-яё]*|[её][бb][л][а-яё]*"
-    r"|[мm][уу][дд][аеёиыьъ]?[кк]?[а-яё]*"
-    r"|[сs][уу][кk][аеёиыь]?[а-яё]*"
-    r"|[бb][лl][яiy][дд]?[ьъ]?"
-    r"|[гg][аоа][вw][нn][аеёиыоуьъ]?[а-яё]*"
-    r"|[зz][аa][лl][уy][пp][аеёиы]?[а-яё]*"
-    r"|негр[а-яё]*"
-    r"|даун[а-яё]*"
-    r")\b",
-    re.IGNORECASE | re.UNICODE,
-)
-
-
-def _censor(text: str) -> str:
-    def replace(m):
-        length = max(3, len(m.group()))
-        return "".join(random.choices(_CENSOR_SYMBOLS, k=length))
-    return _PROFANITY_PATTERNS.sub(replace, text)
+from censor import censor as _censor
 
 
 # ─── Overlay HTML (OBS Browser Source) ───────────────────────────────────────
-
-_OVERLAY = """\
-<!DOCTYPE html><html><head><meta charset="UTF-8">
-<style>
-:root {{ --bubble-bg: {bubble_bg}; }}
-* {{ margin:0; padding:0; box-sizing:border-box }}
-body {{
-  background: transparent;
-  display: flex; align-items: {align_items}; justify-content: center;
-  min-height: 100vh; padding: 30px 40px;
-  font-family: '{font_family}', 'Segoe UI', Arial, sans-serif;
-  overflow: hidden;
-}}
-#sub {{
-  color: {font_color};
-  font-size: {font_size}px;
-  font-weight: {font_weight};
-  font-style: {font_style};
-  text-decoration: {text_decoration};
-  text-align: {text_align};
-  text-shadow: {text_shadow_css};
-  max-width: {max_width}%; line-height: 1.4; padding: 12px 24px;
-  border-radius: 10px;
-  background: {bg_css};
-  position: relative;
-}}
-/* ── Стиль облачко ── */
-#sub.bubble {{ border-radius: 24px; }}
-#sub.bubble::after {{
-  content: '';
-  position: absolute;
-  bottom: -17px; left: 50%;
-  transform: translateX(-50%);
-  border: 9px solid transparent;
-  border-top: 10px solid var(--bubble-bg);
-}}
-/* ── Fade (по умолчанию) ── */
-body[data-anim="fade"] #sub {{ transition: opacity .6s ease; }}
-body[data-anim="fade"] #sub.out {{ opacity: 0; }}
-/* ── Slide-left: влетает справа, улетает влево ── */
-@keyframes fromRight {{ from {{ transform:translateX(110%); opacity:0 }} to {{ transform:translateX(0); opacity:1 }} }}
-@keyframes toLeft    {{ from {{ transform:translateX(0); opacity:1 }} to {{ transform:translateX(-110%); opacity:0 }} }}
-/* ── Slide-right: влетает слева, улетает вправо ── */
-@keyframes fromLeft  {{ from {{ transform:translateX(-110%); opacity:0 }} to {{ transform:translateX(0); opacity:1 }} }}
-@keyframes toRight   {{ from {{ transform:translateX(0); opacity:1 }} to {{ transform:translateX(110%); opacity:0 }} }}
-body[data-anim="slide-left"]  #sub.entering {{ animation: fromRight .35s ease forwards }}
-body[data-anim="slide-left"]  #sub.out      {{ animation: toLeft    .35s ease forwards }}
-body[data-anim="slide-right"] #sub.entering {{ animation: fromLeft  .35s ease forwards }}
-body[data-anim="slide-right"] #sub.out      {{ animation: toRight   .35s ease forwards }}
-#dbg {{
-  position: fixed; top: 6px; left: 8px;
-  font-size: 12px; color: #ff5555; font-family: monospace;
-  text-shadow: 1px 1px 0 #000; pointer-events: none;
-}}
-</style></head><body data-anim="{anim_type}">
-<div id="dbg">socket: connecting...</div>
-<div id="sub" class="{bubble_class}out"></div>
-<script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
-<script>
-const el  = document.getElementById('sub');
-const dbg = document.getElementById('dbg');
-let fadeDelay = {fade_ms}, timer = null;
-const socket = io();
-socket.on('connect',    () => {{ dbg.style.color='#55ff55'; dbg.textContent='socket: OK'; setTimeout(()=>dbg.remove(),5000); }});
-socket.on('disconnect', () => {{ dbg.style.color='#ff5555'; dbg.textContent='socket: DISCONNECTED'; }});
-function show(text) {{
-  clearTimeout(timer);
-  if (!text) {{ hide(); return; }}
-  el.classList.remove('out', 'entering');
-  void el.offsetWidth;
-  el.textContent = text;
-  el.classList.add('entering');
-  timer = setTimeout(hide, fadeDelay);
-}}
-function hide() {{
-  el.classList.remove('entering');
-  void el.offsetWidth;
-  el.classList.add('out');
-}}
-socket.on('subtitle', ({{ text }}) => show(text));
-socket.on('settings', d => {{
-  if (d.font_size)       el.style.fontSize       = d.font_size + 'px';
-  if (d.font_color)      el.style.color          = d.font_color;
-  if (d.font_weight)     el.style.fontWeight     = d.font_weight;
-  if (d.font_style)      el.style.fontStyle      = d.font_style;
-  if (d.text_decoration) el.style.textDecoration = d.text_decoration;
-  if (d.font_family)     el.style.fontFamily     = d.font_family;
-  if (d.bg_css) {{
-    el.style.background = d.bg_css;
-    document.documentElement.style.setProperty('--bubble-bg', d.bg_css);
-  }}
-  if (d.fade_delay)            fadeDelay = d.fade_delay;
-  if (d.anim_type)             document.body.setAttribute('data-anim', d.anim_type);
-  if ('bubble_style' in d)     el.classList.toggle('bubble', d.bubble_style);
-  if (d.text_align)            el.style.textAlign = d.text_align;
-  if (d.max_width)             el.style.maxWidth  = d.max_width + '%';
-  if (d.position) {{ const m={{top:'flex-start',center:'center',bottom:'flex-end'}}; document.body.style.alignItems = m[d.position]||'flex-end'; }}
-  if ('text_shadow' in d)      el.style.textShadow = d.text_shadow ? '2px 2px 0 #000,-2px 2px 0 #000,2px -2px 0 #000,-2px -2px 0 #000,0 4px 8px rgba(0,0,0,.9)' : 'none';
-}});
-</script></body></html>"""
 
 # ─── Mic HTML (открывается в Chrome) ──────────────────────────────────────────
 
@@ -199,7 +78,8 @@ button.stop:hover {{ background: #7a2a2a }}
 <div id="partial"></div>
 <div id="ws-status">WebSocket: подключение...</div>
 
-<script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+<script src="/static/socket.io.min.js"></script>
+<script src="/static/speech.js"></script>
 <script>
 const dot         = document.getElementById('dot');
 const statusText  = document.getElementById('status-text');
@@ -214,82 +94,17 @@ const socket = io({{ transports: ['websocket'] }});
 socket.on('connect',    () => {{ wsStatus.textContent = 'WebSocket: подключено'; }});
 socket.on('disconnect', () => {{ wsStatus.textContent = 'WebSocket: разрыв — переподключение...'; }});
 
-// ── Speech Recognition ────────────────────────────────────────────────
-const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-let rec = null, active = false;
-
-function setStatus(text, state) {{
-  statusText.textContent = text;
-  dot.className = state || '';
-}}
-
-function toggle() {{
-  if (active) stopRec(); else startRec();
-}}
-
-function startRec() {{
-  if (!SR) {{
-    setStatus('Нужен Chrome или Edge', 'error');
-    return;
-  }}
-  rec = new SR();
-  rec.continuous      = true;
-  rec.interimResults  = true;
-  rec.lang            = lang;
-  rec.maxAlternatives = 1;
-
-  rec.onstart = () => {{
-    active = true;
-    btn.textContent = '■  Stop'; btn.className = 'stop';
-    setStatus('Слушаю...', 'listening');
-  }};
-
-  rec.onresult = (e) => {{
-    let interim = '', final = '';
-    for (let i = e.resultIndex; i < e.results.length; i++) {{
-      const t = e.results[i][0].transcript;
-      if (e.results[i].isFinal) final += t; else interim += t;
-    }}
-    if (interim) {{
-      partialEl.className = '';
-      partialEl.textContent = interim;
-      socket.emit('transcript', {{ text: interim, final: false }});
-    }}
-    if (final) {{
-      const f = final.trim();
-      partialEl.className = 'final';
-      partialEl.textContent = f;
-      socket.emit('transcript', {{ text: f, final: true }});
-    }}
-  }};
-
-  rec.onerror = (e) => {{
-    if (e.error === 'no-speech') return;
-    if (e.error === 'not-allowed') {{
-      setStatus('Нет доступа к микрофону', 'error');
-      active = false; return;
-    }}
-    setStatus('Ошибка: ' + e.error, 'error');
-  }};
-
-  rec.onend = () => {{
-    if (active) setTimeout(() => {{ if (active) rec.start(); }}, 200);
-    else setStatus('Остановлено', '');
-  }};
-
-  rec.start();
-}}
-
-function stopRec() {{
-  active = false;
-  if (rec) rec.stop();
-  btn.textContent = '▶  Start'; btn.className = '';
-  setStatus('Остановлено', '');
-  partialEl.textContent = '';
-}}
-
-// Авто-старт
-startRec();
+const speech = new LiveSpeech({{
+  socket, language: () => lang,
+  state: (state, message) => {{
+    btn.textContent = state === 'idle' || state === 'error' ? '▶ Start' : '■ Stop';
+    btn.className = state === 'listening' ? 'stop' : '';
+    setStatus(message, state === 'listening' ? 'listening' : state === 'error' ? 'error' : '');
+  }},
+  text: (text, final) => {{ partialEl.textContent = text; partialEl.className = final ? 'final' : ''; }}
+}});
+function setStatus(text, state) {{ statusText.textContent = text; dot.className = state || ''; }}
+function toggle() {{ speech.toggle(); }}
 </script></body></html>"""
 
 
@@ -436,6 +251,7 @@ input[type=color]{width:34px;height:28px;border:1px solid var(--brd);border-radi
         <div class="rrow"><input type="range" id="bg_opacity" min="0" max="100" oninput="upd(this,'bo')"><span class="rval" id="bo">35%</span></div></div>
       <div class="fld"><label>Анимация субтитра</label>
         <div class="seg" id="anim_type">
+          <button onclick="seg(this,'anim_type')">none</button>
           <button class="on" onclick="seg(this,'anim_type')">fade</button>
           <button onclick="seg(this,'anim_type')">slide-left</button>
           <button onclick="seg(this,'anim_type')">slide-right</button>
@@ -471,58 +287,34 @@ input[type=color]{width:34px;height:28px;border:1px solid var(--brd);border-radi
     <button class="apply" onclick="applySettings()">Применить настройки</button>
   </div>
 </div>
-<script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+<script src="/static/socket.io.min.js"></script>
+<script src="/static/speech.js"></script>
 <script>
 // ── Socket ──────────────────────────────────────────────────────────────
-const socket = io();
+const socket = io({ transports: ['websocket'], upgrade: false });
 socket.on('connect', () => { wsd.className='ws-dot on'; wst.textContent='подключено'; });
 socket.on('disconnect', () => { wsd.className='ws-dot err'; wst.textContent='разрыв'; });
-socket.on('log', ({text}) => addLog(text));
+socket.on('log', ({text,speaker}) => addLog(speaker ? speaker.name + ': ' + text : text));
 const wsd = document.getElementById('wsd'), wst = document.getElementById('wst');
 
-// ── Speech recognition ──────────────────────────────────────────────────
-const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-let rec = null, active = false, lang = 'ru-RU';
+let lang = 'ru-RU';
 const mwrap = document.getElementById('mwrap'), mbtn = document.getElementById('mbtn');
-const wave  = document.getElementById('wave'),  mst  = document.getElementById('mst');
-const partEl= document.getElementById('partial');
-
-function setMicState(listening) {
-  if (listening) {
-    mbtn.textContent = '■'; mbtn.className = 'mic-btn stop';
-    mwrap.className = 'mic-wrap listening'; wave.className = 'wave listening';
-    mst.className = 'mic-status on'; mst.textContent = 'Слушаю...';
-  } else {
-    mbtn.textContent = '🎤'; mbtn.className = 'mic-btn';
-    mwrap.className = 'mic-wrap'; wave.className = 'wave';
-    mst.className = 'mic-status'; mst.textContent = 'Нажмите, чтобы начать распознавание';
-    partEl.textContent = ''; partEl.className = 'partial';
-  }
-}
-function toggle() { if (active) stopRec(); else startRec(); }
-function startRec() {
-  if (!SR) { mst.className='mic-status err'; mst.textContent='Нужен Chrome или Edge'; return; }
-  rec = new SR();
-  rec.continuous = true; rec.interimResults = true; rec.lang = lang; rec.maxAlternatives = 1;
-  rec.onstart = () => { active = true; setMicState(true); };
-  rec.onresult = (e) => {
-    let interim = '', final = '';
-    for (let i = e.resultIndex; i < e.results.length; i++) {
-      const t = e.results[i][0].transcript;
-      if (e.results[i].isFinal) final += t; else interim += t;
-    }
-    if (interim) { partEl.className='partial'; partEl.textContent=interim; socket.emit('transcript',{text:interim,final:false}); }
-    if (final)   { const f=final.trim(); partEl.className='partial final'; partEl.textContent=f; socket.emit('transcript',{text:f,final:true}); }
-  };
-  rec.onerror = (e) => {
-    if (e.error==='no-speech') return;
-    if (e.error==='not-allowed') { mst.className='mic-status err'; mst.textContent='Нет доступа к микрофону'; active=false; return; }
-    mst.className='mic-status err'; mst.textContent='Ошибка: '+e.error;
-  };
-  rec.onend = () => { if (active) setTimeout(()=>{ if(active) rec.start(); },200); else setMicState(false); };
-  rec.start();
-}
-function stopRec() { active=false; if(rec) rec.stop(); setMicState(false); }
+const wave = document.getElementById('wave'), mst = document.getElementById('mst');
+const partEl = document.getElementById('partial');
+const speech = new LiveSpeech({
+  socket, language: () => lang,
+  state: (state, message) => {
+    const listening = state === 'listening';
+    mbtn.textContent = state === 'idle' || state === 'error' ? '🎤' : '■';
+    mbtn.className = 'mic-btn' + (listening ? ' stop' : '');
+    mwrap.className = 'mic-wrap' + (listening ? ' listening' : '');
+    wave.className = 'wave' + (listening ? ' listening' : '');
+    mst.className = 'mic-status ' + (listening ? 'on' : state === 'error' ? 'err' : '');
+    mst.textContent = message;
+  },
+  text: (text, final) => { partEl.textContent = text; partEl.className = 'partial' + (final ? ' final' : ''); }
+});
+function toggle() { speech.toggle(); }
 
 // ── Log ─────────────────────────────────────────────────────────────────
 function escHtml(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
@@ -532,7 +324,7 @@ function addLog(text) {
   const t = new Date().toLocaleTimeString('ru');
   const hi = escHtml(text).replace(/[!@#$%^&*]{2,}/g, m => '<span class="cens">'+m+'</span>');
   d.innerHTML = '<span class="ts">'+t+'</span><span class="ltxt">'+hi+'</span>';
-  log.appendChild(d); log.scrollTop = log.scrollHeight;
+  log.appendChild(d); while (log.children.length > 200) log.firstElementChild.remove(); log.scrollTop = log.scrollHeight;
 }
 
 // ── UI helpers ───────────────────────────────────────────────────────────
@@ -547,8 +339,8 @@ function setSegVal(gid,val) { document.querySelectorAll('#'+gid+' button').forEa
 // ── Load config ──────────────────────────────────────────────────────────
 fetch('/api/config').then(r=>r.json()).then(cfg=>{
   const port = cfg.port||5000;
-  document.getElementById('obs-url').value = 'http://localhost:'+port;
-  document.getElementById('adm-url').value = 'http://localhost:'+port+'/admin';
+  document.getElementById('obs-url').value = window.location.origin;
+  document.getElementById('adm-url').value = window.location.origin+'/admin';
   document.getElementById('font_family').value = cfg.font_family||'Segoe UI';
   const fs=document.getElementById('font_size'); fs.value=cfg.font_size||44; document.getElementById('fz').textContent=fs.value+'px';
   document.getElementById('font_color').value    = cfg.font_color||'#ffffff';
@@ -595,7 +387,7 @@ function applySettings() {
     port:           +document.getElementById('port').value,
   };
   fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)})
-    .then(()=>{ const btn=document.querySelector('.apply'); btn.textContent='✓ Применено'; setTimeout(()=>btn.textContent='Применить настройки',2000); });
+    .then(async r=>{ if(!r.ok) throw new Error((await r.json()).error || 'Ошибка сохранения'); speech.setLanguage(); const btn=document.querySelector('.apply'); btn.textContent='✓ Применено'; setTimeout(()=>btn.textContent='Применить настройки',2000); }).catch(e=>{ mst.textContent=e.message; mst.className='mic-status err'; });
 }
 </script></body></html>"""
 
@@ -766,6 +558,17 @@ def _bg_css(config: dict) -> str:
     return f"rgba({r},{g},{b},{a})"
 
 
+class _ExclusiveServer(ThreadedWSGIServer):
+    """На Windows SO_REUSEADDR позволяет нескольким копиям слушать один порт,
+    и OBS подключается к случайной (часто старой) копии приложения."""
+    allow_reuse_address = sys.platform != 'win32'
+
+    def server_bind(self):
+        if sys.platform == 'win32':
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+
 class SubtitleServer:
     def __init__(
         self,
@@ -775,39 +578,135 @@ class SubtitleServer:
         self._on_transcript = on_transcript
         self._on_save = on_save
         self._app  = Flask(__name__)
-        self._sio  = SocketIO(self._app, cors_allowed_origins="*", async_mode="threading")
-        self._config: dict = {
-            "font_size": 44, "fade_delay": 5, "language": "ru",
-            "font_family": "Segoe UI", "font_color": "#ffffff",
-            "font_bold": True, "font_italic": False, "font_underline": False,
-            "bg_color": "#000000", "bg_opacity": 35,
-            "censor": False, "anim_type": "fade", "bubble_style": False,
-            "position": "bottom", "text_align": "center", "text_shadow": True, "max_width": 90,
-        }
+        self._sio  = SocketIO(self._app, async_mode="threading", async_handlers=False, max_http_buffer_size=16384)
+        self._config = DEFAULT_CONFIG.copy()
+        self._lock = threading.RLock()
+        self._http = None
+        self._sequence = 0
+        self._probes = {}
+        self.render_ms = deque(maxlen=120)
+        self._last_text = {}
+        self._speakers = {}
+        self._captions = {}
+        self._on_caption = None
+        self._source = None
+        self._source_seen = 0.0
         self._port: Optional[int] = None
         self._setup_routes()
 
     # ── Публичные методы ───────────────────────────────────────────────────
 
     def start(self, port: int, config: dict) -> None:
-        self._config = config
-        self._port   = port
-        threading.Thread(
-            target=lambda: self._sio.run(
-                self._app, host="0.0.0.0", port=port, use_reloader=False,
-                allow_unsafe_werkzeug=True
-            ),
-            daemon=True,
-        ).start()
+        self._config.update(validate_config(config))
+        self._port = port
+        # Bind synchronously so an occupied port fails before opening the UI.
+        self._http = _ExclusiveServer('127.0.0.1', port, self._app)
+        self._port = self._http.server_port
+        threading.Thread(target=self._http.serve_forever, daemon=True).start()
+
+    def stop(self):
+        if self._http:
+            self._http.shutdown()
+            self._http.server_close()
+
+    @property
+    def config(self):
+        with self._lock:
+            return self._config.copy()
+
+    def save_settings(self, data):
+        patch = validate_config(data)
+        with self._lock:
+            config = {**self._config, **patch}
+            if self._on_save:
+                self._on_save(config)
+            self.update_config(config)
+        return config
+
+    def claim_source(self, source):
+        with self._lock:
+            now = time.monotonic()
+            if self._source not in (None, source):
+                return False
+            self._source, self._source_seen = source, now
+            return True
+
+    def release_source(self, source):
+        with self._lock:
+            if self._source == source:
+                self._source = None
+
+    def register_speaker(self, source, name):
+        if not isinstance(source, str) or not source.startswith('discord:'):
+            raise ValueError('Invalid Discord source')
+        with self._lock:
+            if source not in self._speakers and len(self._speakers) >= 8:
+                return False
+            palette = ['#a78bfa', '#34d399', '#fb923c', '#f472b6', '#facc15', '#22d3ee', '#f87171', '#a3e635']
+            old = self._speakers.get(source)
+            self._speakers[source] = {'id': source, 'name': str(name).strip()[:40] or 'Discord',
+                                      'color': old['color'] if old else next((color for color in palette if color not in {item['color'] for item in self._speakers.values()}), palette[0])}
+            return True
+
+    def remove_speaker(self, source):
+        with self._lock:
+            self.emit_clear(source)
+            self._speakers.pop(source, None)
+
+    def submit_transcript(self, text, final=False, source='native'):
+        if not isinstance(text, str) or type(final) is not bool:
+            return False
+        text = text.strip()[:4000]
+        if not text:
+            return False
+        with self._lock:
+            if source in self._speakers:
+                speaker = self._speakers[source]
+            else:
+                if source.startswith('discord:') or not self.claim_source(source):
+                    return False
+                speaker = {'id': 'self', 'name': self._config.get('speaker_name', 'Я'), 'color': '#60a5fa'}
+            key = speaker['id']
+            if self._config.get('censor'):
+                text = _censor(text, self._config.get('custom_censor_words', '').replace(',', ' ').split())
+            packet = {'text': text, 'speaker': speaker, 'final': final}
+            if text != self._last_text.get(key):
+                self._sequence += 1
+                seq = self._sequence
+                probe = seq % 10 == 1
+                if probe:
+                    self._probes[seq] = time.perf_counter()
+                    if len(self._probes) > 120:
+                        del self._probes[next(iter(self._probes))]
+                packet.update(seq=seq, probe=probe)
+                self._sio.emit('subtitle', packet)
+                self._last_text[key] = text
+                self._captions[key] = (time.monotonic(), packet.copy())
+            if final:
+                self._sio.emit('log', packet)
+                self._last_text.pop(key, None)
+            if self._on_transcript:
+                self._on_transcript(text, final)
+            if self._on_caption:
+                self._on_caption(packet)
+        return True
 
     def emit_text(self, text: str) -> None:
-        self._sio.emit("subtitle", {"text": text})
+        self._sio.emit('subtitle', {'text': text, 'speaker': {'id': 'self', 'name': self._config.get('speaker_name', 'Я'), 'color': '#60a5fa'}})
 
-    def emit_clear(self) -> None:
-        self._sio.emit("subtitle", {"text": ""})
+    def emit_clear(self, source=None) -> None:
+        with self._lock:
+            if source is None:
+                self._last_text.clear()
+                self._captions.clear()
+                self._sio.emit('subtitle', {'text': '', 'clear': True})
+            else:
+                self._last_text.pop(source, None)
+                self._captions.pop(source, None)
+                self._sio.emit('subtitle', {'text': '', 'speaker': {'id': source}})
 
     def update_config(self, config: dict) -> None:
-        self._config = config
+        self._config.update(config)
         self._sio.emit("settings", {
             "font_size":       config["font_size"],
             "font_color":      config.get("font_color", "#ffffff"),
@@ -823,6 +722,10 @@ class SubtitleServer:
             "position":        config.get("position", "bottom"),
             "text_shadow":     config.get("text_shadow", True),
             "max_width":       config.get("max_width", 90),
+            "subtitle_theme": config.get("subtitle_theme", "classic"),
+            "show_speakers": config.get("show_speakers", True),
+            "max_speakers": config.get("max_speakers", 6),
+            "speaker_name": config.get("speaker_name", "Я"),
         })
 
     @property
@@ -846,25 +749,17 @@ class SubtitleServer:
     def _setup_routes(self) -> None:
         @self._app.route("/")
         def overlay():
-            cfg = self._config
-            bubble_class = "bubble " if cfg.get("bubble_style", False) else ""
-            return _OVERLAY.format(
-                font_size=cfg["font_size"],
-                fade_ms=cfg["fade_delay"] * 1000,
-                font_family=cfg.get("font_family", "Segoe UI"),
-                font_color=cfg.get("font_color", "#ffffff"),
-                font_weight="bold" if cfg.get("font_bold", True) else "normal",
-                font_style="italic" if cfg.get("font_italic", False) else "normal",
-                text_decoration="underline" if cfg.get("font_underline", False) else "none",
-                bg_css=_bg_css(cfg),
-                anim_type=cfg.get("anim_type", "fade"),
-                bubble_class=bubble_class,
-                bubble_bg=_bg_css(cfg),
-                align_items={"top": "flex-start", "center": "center", "bottom": "flex-end"}.get(cfg.get("position", "bottom"), "flex-end"),
-                text_align=cfg.get("text_align", "center"),
-                text_shadow_css="2px 2px 0 #000,-2px 2px 0 #000,2px -2px 0 #000,-2px -2px 0 #000,0 4px 8px rgba(0,0,0,.9)" if cfg.get("text_shadow", True) else "none",
-                max_width=cfg.get("max_width", 90),
-            )
+            return send_from_directory(self._app.static_folder, 'overlay.html')
+
+        @self._sio.on('overlay_ready')
+        def overlay_ready():
+            with self._lock:
+                now = time.monotonic()
+                self._sio.emit('config_snapshot', self.config, to=request.sid)
+                for seen, packet in self._captions.values():
+                    remaining = self._config['fade_delay'] - (now - seen)
+                    if remaining > 0:
+                        self._sio.emit('subtitle', {**packet, 'probe': False, 'remaining_ms': remaining * 1000}, to=request.sid)
 
         @self._app.route("/mic")
         def mic():
@@ -881,31 +776,50 @@ class SubtitleServer:
 
         @self._app.route("/api/config", methods=["GET"])
         def get_config():
-            return jsonify(self._config)
+            return jsonify(self.config)
 
         @self._app.route("/api/config", methods=["POST"])
         def post_config():
-            data = request.json or {}
-            self._config.update(data)
-            self.update_config(self._config)
-            if self._on_save:
-                self._on_save(self._config)
-            return jsonify({"ok": True})
+            try:
+                self.save_settings(request.get_json())
+            except ValueError as exc:
+                return jsonify({'error': str(exc)}), 400
+            except OSError:
+                return jsonify({'error': 'Не удалось сохранить настройки'}), 500
+            return jsonify({'ok': True})
+
+        @self._app.route('/api/metrics')
+        def metrics():
+            values = sorted(self.render_ms)
+            return jsonify(samples=len(values),
+                           render_ack_p95_ms=values[min(len(values)-1, int(len(values)*0.95))] if values else None)
 
         @self._app.route("/api/clear", methods=["POST"])
         def api_clear():
             self.emit_clear()
             return jsonify({"ok": True})
 
-        @self._sio.on("transcript")
+        @self._sio.on('claim')
+        def claim():
+            return {'ok': self.claim_source(request.sid)}
+
+        @self._sio.on('release')
+        def release():
+            self.release_source(request.sid)
+
+        @self._sio.on('disconnect')
+        def disconnect(reason=None):
+            self.release_source(request.sid)
+
+        @self._sio.on('rendered')
+        def rendered(data):
+            if isinstance(data, dict) and type(data.get('seq')) is int:
+                with self._lock:
+                    start = self._probes.pop(data['seq'], None)
+                    if start is not None:
+                        self.render_ms.append((time.perf_counter() - start) * 1000)
+
+        @self._sio.on('transcript')
         def handle_transcript(data):
-            text  = data.get("text", "").strip()
-            final = data.get("final", True)
-            if text:
-                if self._config.get("censor", False):
-                    text = _censor(text)
-                self._sio.emit("subtitle", {"text": text})
-                if final:
-                    self._sio.emit("log", {"text": text})
-                if self._on_transcript:
-                    self._on_transcript(text, final)
+            if isinstance(data, dict):
+                self.submit_transcript(data.get('text'), data.get('final', True), source=request.sid)
