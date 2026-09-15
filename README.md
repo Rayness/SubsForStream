@@ -1,4 +1,4 @@
-<div align="center">
+﻿<div align="center">
 
 # SubForStream
 
@@ -7,7 +7,7 @@
 Говорите — зрители видят текст на экране через доли секунды.
 Подключите Discord — и субтитры появятся у каждого участника голосового канала, со своим именем и цветом.
 
-[**⬇ Скачать**](https://github.com/Rayness/StreamWithSubs/releases/latest) ·
+[**⬇ Скачать**](https://github.com/Rayness/SubsForStream/releases/latest) ·
 [Настройка за 2 минуты](#быстрый-старт) ·
 [Discord](DISCORD_SETUP.md) ·
 [Вопросы](#частые-проблемы) ·
@@ -48,7 +48,7 @@
 
 ## Быстрый старт
 
-1. **Скачайте** архив со страницы [Releases](https://github.com/Rayness/StreamWithSubs/releases/latest) и распакуйте **всю папку** в любое место.
+1. **Скачайте** архив со страницы [Releases](https://github.com/Rayness/SubsForStream/releases/latest) и распакуйте **всю папку** в любое место.
 2. **Запустите** `SubForStream.exe`, выберите микрофон и язык.
 3. Нажмите **«Начать»**. При первом запуске скачается модель распознавания (один раз, дальше всё работает без интернета).
 4. В OBS: **Источники → + → Браузер**
@@ -130,8 +130,8 @@
 Нужны Windows 10/11 x64, Python 3.13 и Git. Для Discord ещё Node.js (проверено на 24.17.0).
 
 ```powershell
-git clone https://github.com/Rayness/StreamWithSubs.git
-cd StreamWithSubs
+git clone https://github.com/Rayness/SubsForStream.git
+cd SubsForStream
 py -3.13 -m venv .venv
 .venv\Scripts\python.exe -m pip install -r requirements.txt
 npm ci --prefix discord_bridge   # только для Discord
@@ -187,7 +187,7 @@ dist-release\SubForStream\SubForStream.exe --check
 ## Помочь проекту
 
 - ⭐ **Поставьте звезду** — так проект легче найти другим стримерам.
-- 🐞 Нашли баг или есть идея? Создайте [Issue](https://github.com/Rayness/StreamWithSubs/issues).
+- 🐞 Нашли баг или есть идея? Создайте [Issue](https://github.com/Rayness/SubsForStream/issues).
 - 📣 Покажите субтитры на своём стриме и расскажите, где скачать программу.
 - ❤ Поддержите разработку на **[Boosty](https://boosty.to/rayness)**.
 
@@ -201,6 +201,6 @@ Recognition runs offline on your PC (Vosk / T-one), with no API keys or subscrip
 It supports Russian and English, 6 subtitle themes, profanity filtering,
 and an optional Discord bot that captions up to 8 voice-channel members separately.
 
-Download the latest build from [Releases](https://github.com/Rayness/StreamWithSubs/releases/latest), run it,
+Download the latest build from [Releases](https://github.com/Rayness/SubsForStream/releases/latest), run it,
 press **Start**, then add a Browser Source in OBS pointing to `http://localhost:5000`.
 </details>
